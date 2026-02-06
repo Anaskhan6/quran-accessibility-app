@@ -1,13 +1,9 @@
 /// audio_focus_manager.dart
 ///
 /// Audio Focus Arbitration Layer
-/// Handles system audio focus events and adjusts playback accordingly
-///
-/// Focus States:
-/// - FullFocus: Normal playback
-/// - DuckFocus: Volume 30%, continue playing
-/// - TransientLoss: Pause, save position
-/// - PermanentLoss: Stop, save state
+/// Audit refinements:
+/// - Added TransientLossCanDuck
+/// - Added resume delay buffer (500ms)
 
 import 'dart:async';
 import 'playback_state_controller.dart';
@@ -16,45 +12,23 @@ import 'playback_state_controller.dart';
 // ENUMS
 // ============================================================================
 
-/// Audio focus type
 enum AudioFocusType {
-  /// Full audio focus - normal playback
   fullFocus,
-
-  /// Duck focus - reduce volume, continue playing
   duckFocus,
-
-  /// Transient loss - pause, expect to resume soon
+  /// Android-specific: brief assistant speech
+  transientLossCanDuck,
   transientLoss,
-
-  /// Permanent loss - stop, save state
   permanentLoss,
 }
 
-/// Audio focus source (what caused focus change)
 enum AudioFocusSource {
-  /// Unknown source
   unknown,
-
-  /// Incoming phone call
   phoneCall,
-
-  /// Voice assistant (Google Assistant, etc)
   voiceAssistant,
-
-  /// Screen reader (TalkBack)
   screenReader,
-
-  /// Another media app
   mediaPlayer,
-
-  /// Alarm or timer
   alarm,
-
-  /// Navigation
   navigation,
-
-  /// Notification sound
   notification,
 }
 
@@ -62,23 +36,14 @@ enum AudioFocusSource {
 // MODELS
 // ============================================================================
 
-/// Audio focus event
 class AudioFocusEvent {
   final AudioFocusType type;
   final AudioFocusSource source;
   final DateTime timestamp;
 
-  const AudioFocusEvent({
-    required this.type,
-    this.source = AudioFocusSource.unknown,
-    required this.timestamp,
-  });
-
-  @override
-  String toString() => 'FocusEvent($type from $source)';
+  const AudioFocusEvent({required this.type, this.source = AudioFocusSource.unknown, required this.timestamp});
 }
 
-/// Saved playback position for resume
 class SavedPlaybackPosition {
   final int? surahId;
   final int? ayahNumber;
@@ -99,37 +64,32 @@ class SavedPlaybackPosition {
 // MANAGER
 // ============================================================================
 
-/// Audio Focus Manager
-///
-/// Arbitrates audio focus events and adjusts playback behavior
 class AudioFocusManager {
   final PlaybackStateController _playbackController;
 
-  // State
   AudioFocusType _currentFocus = AudioFocusType.fullFocus;
   SavedPlaybackPosition? _savedPosition;
   double _preDuckVolume = 1.0;
   bool _isPausedForFocus = false;
+  DateTime? _focusLostAt;
+  Timer? _resumeDelayTimer;
 
   // Configuration
   final double duckVolume;
   final Duration duckFadeDuration;
   final Duration restoreFadeDuration;
+  /// AUDIT: Resume delay to avoid speech spam
+  final Duration resumeDelayBuffer;
 
-  // Streams
   final _focusController = StreamController<AudioFocusEvent>.broadcast();
   final _volumeController = StreamController<double>.broadcast();
+  /// Announce resume only if delay exceeded
+  final _announceResumeController = StreamController<bool>.broadcast();
 
-  /// Audio focus event stream
   Stream<AudioFocusEvent> get focusStream => _focusController.stream;
-
-  /// Volume change stream (for FFI to apply)
   Stream<double> get volumeStream => _volumeController.stream;
-
-  /// Current focus state
+  Stream<bool> get announceResumeStream => _announceResumeController.stream;
   AudioFocusType get currentFocus => _currentFocus;
-
-  /// Whether paused due to focus loss
   bool get isPausedForFocus => _isPausedForFocus;
 
   AudioFocusManager({
@@ -137,44 +97,31 @@ class AudioFocusManager {
     this.duckVolume = 0.3,
     this.duckFadeDuration = const Duration(milliseconds: 100),
     this.restoreFadeDuration = const Duration(milliseconds: 500),
+    this.resumeDelayBuffer = const Duration(milliseconds: 500), // AUDIT
   }) : _playbackController = playbackController;
 
   // ===========================================================================
   // PUBLIC API
   // ===========================================================================
 
-  /// Handle audio focus change from system
-  void onAudioFocusChange(
-    AudioFocusType newFocus, {
-    AudioFocusSource source = AudioFocusSource.unknown,
-  }) {
+  void onAudioFocusChange(AudioFocusType newFocus, {AudioFocusSource source = AudioFocusSource.unknown}) {
     final oldFocus = _currentFocus;
     _currentFocus = newFocus;
 
-    _focusController.add(AudioFocusEvent(
-      type: newFocus,
-      source: source,
-      timestamp: DateTime.now(),
-    ));
-
+    _focusController.add(AudioFocusEvent(type: newFocus, source: source, timestamp: DateTime.now()));
     _handleFocusTransition(oldFocus, newFocus, source);
   }
 
-  /// Request audio focus
   Future<bool> requestFocus() async {
-    // Platform channel would request actual focus here
-    // For now, assume success
     _currentFocus = AudioFocusType.fullFocus;
     return true;
   }
 
-  /// Abandon audio focus
   void abandonFocus() {
     _currentFocus = AudioFocusType.permanentLoss;
     _handleStop();
   }
 
-  /// Resume after transient loss (if applicable)
   void tryResume() {
     if (_isPausedForFocus && _savedPosition != null) {
       _handleResume();
@@ -185,17 +132,18 @@ class AudioFocusManager {
   // FOCUS TRANSITIONS
   // ===========================================================================
 
-  void _handleFocusTransition(
-    AudioFocusType from,
-    AudioFocusType to,
-    AudioFocusSource source,
-  ) {
+  void _handleFocusTransition(AudioFocusType from, AudioFocusType to, AudioFocusSource source) {
     switch (to) {
       case AudioFocusType.fullFocus:
         _handleFullFocus(from);
         break;
 
       case AudioFocusType.duckFocus:
+        _handleDuck(source);
+        break;
+
+      case AudioFocusType.transientLossCanDuck:
+        // AUDIT: Brief assistant - duck but don't pause
         _handleDuck(source);
         break;
 
@@ -210,44 +158,44 @@ class AudioFocusManager {
   }
 
   void _handleFullFocus(AudioFocusType from) {
-    if (from == AudioFocusType.duckFocus) {
-      // Restore volume
+    _resumeDelayTimer?.cancel();
+
+    if (from == AudioFocusType.duckFocus || from == AudioFocusType.transientLossCanDuck) {
       _restoreVolume();
     } else if (from == AudioFocusType.transientLoss) {
-      // Resume playback
-      _handleResume();
+      // AUDIT: Check if focus returned within delay buffer
+      final focusLostDuration = _focusLostAt != null 
+          ? DateTime.now().difference(_focusLostAt!) 
+          : Duration.zero;
+
+      if (focusLostDuration < resumeDelayBuffer) {
+        // Silent resume - no announcement
+        _handleResume(announce: false);
+      } else {
+        // Normal resume with announcement
+        _handleResume(announce: true);
+      }
     }
   }
 
   void _handleDuck(AudioFocusSource source) {
-    // Save current volume
-    _preDuckVolume = 1.0; // Would get from audio engine
-
-    // Duck volume
+    _preDuckVolume = 1.0;
     _volumeController.add(duckVolume);
-
-    // For screen reader, we want to duck but not pause
-    // Continue playback at reduced volume
   }
 
   void _handleTransientLoss(AudioFocusSource source) {
-    // Save current state
+    _focusLostAt = DateTime.now();
     _saveCurrentPosition();
-
-    // Pause playback
     _playbackController.pause();
     _isPausedForFocus = true;
   }
 
   void _handlePermanentLoss(AudioFocusSource source) {
-    // Save state for possible recovery
     _saveCurrentPosition();
-
-    // Stop playback
     _handleStop();
   }
 
-  void _handleResume() {
+  void _handleResume({bool announce = true}) {
     if (_savedPosition == null) return;
 
     if (_savedPosition!.wasPlaying) {
@@ -256,6 +204,9 @@ class AudioFocusManager {
 
     _isPausedForFocus = false;
     _savedPosition = null;
+    _focusLostAt = null;
+
+    _announceResumeController.add(announce);
   }
 
   void _handleStop() {
@@ -269,7 +220,6 @@ class AudioFocusManager {
 
   void _saveCurrentPosition() {
     final state = _playbackController.state;
-
     _savedPosition = SavedPlaybackPosition(
       surahId: state.surahId,
       ayahNumber: state.ayahNumber,
@@ -283,76 +233,32 @@ class AudioFocusManager {
   // SPECIAL CASES
   // ===========================================================================
 
-  /// Handle incoming phone call
   void onPhoneCall(bool ringing) {
-    if (ringing) {
-      onAudioFocusChange(
-        AudioFocusType.transientLoss,
-        source: AudioFocusSource.phoneCall,
-      );
-    } else {
-      onAudioFocusChange(
-        AudioFocusType.fullFocus,
-        source: AudioFocusSource.phoneCall,
-      );
-    }
+    onAudioFocusChange(ringing ? AudioFocusType.transientLoss : AudioFocusType.fullFocus, source: AudioFocusSource.phoneCall);
   }
 
-  /// Handle TalkBack speaking
   void onScreenReaderSpeaking(bool speaking) {
-    if (speaking) {
-      onAudioFocusChange(
-        AudioFocusType.duckFocus,
-        source: AudioFocusSource.screenReader,
-      );
-    } else {
-      onAudioFocusChange(
-        AudioFocusType.fullFocus,
-        source: AudioFocusSource.screenReader,
-      );
-    }
+    onAudioFocusChange(speaking ? AudioFocusType.duckFocus : AudioFocusType.fullFocus, source: AudioFocusSource.screenReader);
   }
 
-  /// Handle voice assistant
   void onVoiceAssistant(bool active) {
-    if (active) {
-      onAudioFocusChange(
-        AudioFocusType.transientLoss,
-        source: AudioFocusSource.voiceAssistant,
-      );
-    } else {
-      onAudioFocusChange(
-        AudioFocusType.fullFocus,
-        source: AudioFocusSource.voiceAssistant,
-      );
-    }
+    // AUDIT: Use transientLossCanDuck for brief interactions
+    onAudioFocusChange(active ? AudioFocusType.transientLossCanDuck : AudioFocusType.fullFocus, source: AudioFocusSource.voiceAssistant);
   }
 
-  /// Handle another media app
   void onOtherMediaApp(bool playing) {
     if (playing) {
-      onAudioFocusChange(
-        AudioFocusType.permanentLoss,
-        source: AudioFocusSource.mediaPlayer,
-      );
+      onAudioFocusChange(AudioFocusType.permanentLoss, source: AudioFocusSource.mediaPlayer);
     }
   }
 
-  // ===========================================================================
-  // LIFECYCLE
-  // ===========================================================================
-
-  /// Get saved position for recovery
   SavedPlaybackPosition? getSavedPosition() => _savedPosition;
+  void clearSavedPosition() => _savedPosition = null;
 
-  /// Clear saved position
-  void clearSavedPosition() {
-    _savedPosition = null;
-  }
-
-  /// Dispose resources
   Future<void> dispose() async {
+    _resumeDelayTimer?.cancel();
     await _focusController.close();
     await _volumeController.close();
+    await _announceResumeController.close();
   }
 }
